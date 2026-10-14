@@ -348,3 +348,87 @@ The following rules apply:
 - Any detected schema inconsistency is recorded in the extraction validation results and extraction logs.
 
 Only data that satisfies the required schema and approved mappings will proceed from Extraction Validation to the Transformation Stage.
+
+# 7. Extraction Acceptance and Handover Rules
+
+The CitiCare extraction acceptance and handover rules determine whether the raw extracted data is ready to proceed to the Transformation Stage. The decision is based on the results of the extraction validation checks.
+
+### Decision Rules
+
+| Validation Condition | Acceptance Criteria | Decision | Pipeline Action | Decision Type | Responsible Role |
+|---|---|---|---|---|---|
+| All critical validation checks pass | Required CSV files and columns are present, required identifiers are valid, primary keys are unique, record counts match, and no critical extraction errors are detected | **APPROVED** | Proceed to the Transformation Stage | Automatic | Pipeline |
+| Non-critical validation warning is detected | Data remains usable, but minor issues such as unexpected additional columns or unusual record counts require verification | **MANUAL REVIEW** | Hold the affected data until the warning is reviewed | Manual | System Administrator / Developer |
+| Required CSV file or column is missing | One or more required datasets or fields are unavailable | **REJECTED** | Stop processing the affected dataset and record the failure in the extraction log | Automatic | Pipeline |
+| Required identifier is missing or invalid | Required primary or foreign key values are missing or cannot be validated | **REJECTED** | Quarantine the affected data and record the validation failure | Automatic | Pipeline |
+| Duplicate primary keys are detected | Primary key uniqueness validation fails | **REJECTED** | Quarantine the affected data for correction | Automatic | Pipeline |
+| Extracted record count does not match the CSV record count | Extraction completeness cannot be confirmed | **REJECTED** | Stop the affected extraction and retry after checking the source CSV file | Automatic | Pipeline |
+| Records fall outside the monthly extraction window | Extracted records do not satisfy the defined incremental extraction period | **REJECTED** | Quarantine the affected records and record the issue in the extraction log | Automatic | Pipeline |
+| Extraction is interrupted or a critical reading error occurs | Python cannot completely read or extract the required CSV data | **FAILED** | Stop the extraction, record the error, and retry after the issue is resolved | Automatic | Pipeline |
+
+### Automatic Approval
+
+Extracted data is automatically approved when all critical validation checks return **PASS**. This includes successful file accessibility, presence of required datasets and columns, valid required identifiers, unique primary keys, matching record counts, valid extraction windows, and completion without critical extraction errors.
+
+When these conditions are satisfied, the pipeline automatically passes the validated raw extracted data to the Transformation Stage.
+
+### Manual Review
+
+Manual review is required when the extraction produces a **WARNING** that does not immediately make the data unusable. This may include unexpected additional columns or unusual record counts that still match the extracted CSV data.
+
+The affected data is temporarily held while the **System Administrator or Developer** reviews the warning. If the issue is determined to be acceptable, the extraction may be approved and passed to the Transformation Stage. If the issue affects data reliability, the extraction is rejected for correction.
+
+### Rejection or Failure
+
+Extracted data is rejected when a critical validation check fails. Critical failures include missing required files or columns, invalid required identifiers, duplicate primary keys, incomplete extraction, records outside the defined extraction window, or critical extraction errors.
+
+Rejected or affected data is **quarantined** to prevent it from entering the Transformation Stage. If the failure is caused by an extraction interruption or temporary file-reading problem, the extraction may be retried after the issue is corrected. All failures and retry results are recorded in the extraction logs.
+
+### Handover
+
+Once an extraction run is approved, the following information is handed over to the Transformation Stage:
+
+- Validated raw extracted data
+- Pipeline run ID
+- Source CSV file name
+- Extraction window
+- Extraction start and end timestamps
+- Number of records read
+- Number of records extracted
+- Number of records rejected
+- Validation results
+- Extraction status
+- Error or warning information, if applicable
+
+Only data with an **APPROVED** extraction status is automatically handed over to the Transformation Stage.
+
+### Validation Summary
+
+| Validation Check | Required Result |
+|---|---|
+| Source accessibility | PASS |
+| Required datasets/files | PASS |
+| Required columns | PASS |
+| Required identifiers | PASS |
+| Primary key uniqueness | PASS |
+| Record count and extraction completeness | PASS |
+| Incremental extraction window | PASS |
+| Extraction error check | PASS |
+| **Overall Extraction** | **APPROVED** |
+
+If any non-critical check returns a **WARNING**, the overall extraction status becomes **MANUAL REVIEW**. If any critical check returns **FAIL**, the overall extraction status becomes **REJECTED** or **FAILED**, and the affected data cannot proceed to the Transformation Stage.
+
+# 8. Common Extraction Problems and Mitigation
+
+The CitiCare extraction process may encounter issues when health records are exported from the PostgreSQL database into CSV files and subsequently extracted using Python. The following problems and mitigation measures are defined to maintain extraction completeness and reliability.
+
+| Problem | Possible Cause | Impact on Extraction | Proposed Solution / Mitigation |
+|---|---|---|---|
+| Missing CSV file | A required dataset was not exported from the PostgreSQL database or was saved in the wrong directory. | Python cannot extract the required dataset, resulting in an incomplete extraction run. | Verify that all required CSV files are present before extraction. Stop the affected extraction and record the missing file in the extraction log. |
+| Missing or changed columns | A column was removed, renamed, or changed in the PostgreSQL source before CSV export. | The exported CSV may no longer match the required schema, causing validation or processing errors. | Validate CSV columns against the documented schema. Reject the affected dataset until the column is restored or an approved field mapping is defined. |
+| Duplicate records | The same records may be included more than once in the exported CSV file. | Duplicate records may produce inaccurate counts and analytical results. | Check primary key uniqueness during extraction validation and quarantine duplicate records for review. |
+| Missing required identifiers | Required identifiers such as `resident_id`, `purok_id`, or other primary and foreign keys contain null or missing values. | Records may not be correctly identified or linked to related health records. | Validate required identifiers before handover. Reject or quarantine affected records until the issue is corrected. |
+| Incorrect incremental extraction window | Incorrect date or change-tracking conditions are used when selecting records for the monthly export. | Records may be missed or records from previous extraction periods may be extracted again. | Validate the extraction date range and store the previous successful extraction timestamp for use in determining the next extraction window. |
+| Record count mismatch | Python reads fewer records than the number contained in the exported CSV file due to incomplete reading, malformed rows, or interruption. | The extracted dataset may be incomplete and should not proceed to transformation. | Compare the number of records in the CSV with the number successfully extracted. Stop the affected dataset when the counts do not match and investigate before retrying. |
+| Invalid or malformed CSV data | The CSV file contains malformed rows, incorrect delimiters, encoding problems, or improperly formatted values. | Python may fail to read some or all records from the CSV file. | Validate file readability and CSV structure before processing. Record parsing errors and quarantine affected data for correction. |
+| Extraction process interruption | Python execution is interrupted because of a system error, unavailable file, or unexpected program failure. | The extraction may stop before all required records are processed, resulting in partial data. | Mark the extraction run as `FAILED` or `PARTIAL`, record the error in the extraction log, and retry the extraction after the cause has been resolved. |
