@@ -18,8 +18,6 @@ TIMESTAMP_COLUMNS = {
     "puroks": ("updated_at", "created_at"),
 }
 
-INPUT_DIR = Path(os.getenv("CITICARE_INPUT_DIR", "data/input"))
-
 
 def _load_dotenv():
     """Load simple KEY=VALUE settings without requiring python-dotenv."""
@@ -35,6 +33,13 @@ def _load_dotenv():
 
 
 _load_dotenv()
+
+DATA_DIR = Path(__file__).resolve().parent / "data"
+INPUT_DIR = Path(os.getenv("CITICARE_INPUT_DIR", str(DATA_DIR / "input")))
+HANDOVER_DIR = Path(os.getenv("CITICARE_HANDOVER_DIR", str(DATA_DIR / "handover")))
+CHECKPOINT_FILE = Path(
+    os.getenv("CITICARE_CHECKPOINT_FILE", str(DATA_DIR / "checkpoint.json"))
+)
 
 
 def read_csv_datasets(input_dir=INPUT_DIR):
