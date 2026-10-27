@@ -154,3 +154,59 @@ Example run IDs and values are illustrative. Actual execution values must be rec
 | Designated reviewers or auditors | Read relevant records for approved review and audit purposes |
 
 Rejected records must not be deleted before the defined retention period or while required for investigation, correction, audit, or recovery. Access to quarantine records must be restricted because the datasets may contain sensitive health information.
+
+# 10. Transformation Acceptance and Handover Rules
+
+The Data Transformation process determines whether its output can proceed to the Data Loading Stage.
+
+## 10.1 Rejection-Rate Threshold
+
+The project must approve the maximum permitted rejection rate before production processing begins. The numeric threshold is not specified in the available documentation and must be formally defined before production approval.
+
+The rejection rate is calculated as:
+
+`rejection_rate = records_rejected / records_read × 100`
+
+The calculation must follow the approved treatment of documented duplicate exclusions and business exclusions. The reporting method must clearly distinguish rejected records from records deliberately excluded by approved business rules.
+
+## 10.2 Decision Rules
+
+| Condition | Acceptance decision | Pipeline action | Approval type |
+|---|---|---|---|
+| All critical checks pass, no unresolved critical issues exist, and the rejection rate is within the approved threshold | `APPROVED` | Package outputs and hand over to the Data Loading Stage | Automatic |
+| Non-critical warnings exist or the rejection rate exceeds the approved threshold | `MANUAL REVIEW` | Hold the batch for investigation and authorized approval | Manual |
+| Any critical validation fails or required schema/relationship checks cannot be completed | `REJECTED` | Stop handover; correct the issue and rerun or quarantine affected data | Automatic stop |
+| Processing cannot complete due to an execution error | `FAILED` | Preserve inputs and logs, correct the cause, and rerun the batch | Recovery procedure |
+
+The responsible project owner or designated data-quality reviewer must approve manual-review cases. A batch must not proceed merely because its rejection rate is low if any critical validation has failed.
+
+## 10.3 Handover Requirements
+
+The handover package must contain:
+
+- Approved transformed CSV files.
+- Transformation run ID and parent extraction run ID.
+- Batch ID and batch window.
+- Record counts, including output, rejected, modified, and documented exclusions.
+- Validation results and the overall acceptance decision.
+- Transformation code and rules versions.
+- Quarantine references and rejection reasons, stored securely.
+- Any approved business summaries and their output schema.
+
+The Data Transformation process prepares the data for loading but does not perform the final database or warehouse load.
+
+# 11. Common Transformation Problems and Mitigation
+
+| Problem | Possible cause | Impact | Mitigation |
+|---|---|---|---|
+| Duplicate records after a rerun | Batch output appended without idempotent handling | Duplicate residents, schedules, or condition records | Use deterministic processing and replace or rebuild output for the same batch ID. |
+| Missing parent record in a monthly batch | Parent record is not included in the current incremental extraction | Valid relationships may be incorrectly treated as orphans | Validate against an approved parent reference dataset or previously validated state. |
+| Invalid date or timestamp | Unexpected format or malformed value in the CSV | Schedule dates or condition timestamps cannot be processed reliably | Apply documented conversion rules; quarantine and log failures. |
+| Unexpected schema change | Required column removed, renamed, or changed | Transformation may fail or produce incorrect output | Compare the input schema with the contract and stop affected processing until reviewed. |
+| Duplicate primary keys | Repeated identifiers in the extracted data | Invalid output keys and potential double counting | Detect duplicates, apply only approved resolution rules, and quarantine unresolved conflicts. |
+| Unrecognized risk or schedule status | Value not covered by the approved mapping | Inconsistent reporting or unsupported classifications | Preserve traceability, flag the value, and obtain an approved mapping before proceeding. |
+| Join row multiplication | Reference keys are not unique or the join is incorrectly defined | Inflated counts and misleading summaries | Validate key uniqueness and join cardinality before accepting output. |
+| Missing reference data | Required parent or lookup dataset is unavailable | Referential integrity cannot be verified | Hold affected records and report the unresolved dependency. |
+| Excessive rejected records | Widespread invalid values or a source-data change | Batch may fail acceptance criteria | Investigate the cause, quantify affected records, correct approved rules or input issues, and rerun. |
+| Sensitive information exposed in logs | Full record contents written to error messages | Unnecessary disclosure of resident information | Log record identifiers and reason codes where possible; restrict access to quarantine files. |
+| Incorrect aggregate totals | Wrong grouping, status mapping, or filtering | Misleading health and consultation reports | Reconcile aggregates against eligible input records and stop handover when differences remain unexplained. |
