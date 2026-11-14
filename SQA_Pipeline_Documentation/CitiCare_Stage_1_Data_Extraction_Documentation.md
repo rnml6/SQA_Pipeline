@@ -39,8 +39,13 @@ The CitiCare system uses PostgreSQL as the primary database for storing resident
 
 ## 1.3 Extraction Method
 
-**Extraction Type:** Batch Extraction  
-**Extraction Tool:** Python
+| Item | Specification |
+|---|---|
+| Extraction type | **Incremental batch extraction**. The first run is a full load; later runs extract only records added or changed since the last successful run. |
+| Extraction tool | **Python 3** — `csv`, `json`, `pathlib`, and `datetime` for file handling and window filtering; `psycopg` for the PostgreSQL export. |
+| Source connection | PostgreSQL connection string supplied through `CITICARE_DATABASE_URL`, `SUPABASE_DB_URL`, or `DATABASE_URL`. |
+| Output format | CSV — `residents.csv`, `resident_chronic_conditions.csv`, `schedules.csv`, `puroks.csv`. |
+| Full-load mode | Used only for the initial load or a controlled full refresh (`--full`). |
 
 The selected records are extracted from PostgreSQL using SQL queries executed through Python and exported into CSV files. These CSV files serve as the input datasets for the succeeding transformation stage, where Python processes, cleans, validates, and transforms the data. This is consistent with the existing CitiCare ETL design in which Python reads exported datasets before loading processed information into SQLite.
 
@@ -71,9 +76,26 @@ The extraction is performed **monthly**. At the end of each month, the pipeline 
 
 ### Incremental Extraction
 
-CitiCare uses an **incremental extraction** method to retrieve newly added or updated health records from the PostgreSQL database. Instead of extracting the entire database during every pipeline run, only records that have been created or modified since the previous extraction are selected.
+CitiCare uses an **incremental extraction** method to retrieve newly added or updated health records from the PostgreSQL database. Instead of extracting the entire database during every pipeline run, only records that have been created or modified since the previous successful extraction are selected.
 
-The extraction window is determined using a timestamp field. The pipeline stores the timestamp of the previous successful extraction and uses it as the starting point for the next extraction
+The pipeline stores the timestamp of the last successful extraction in the checkpoint file `data/checkpoint.json`, using the field `last_successful_extraction` (UTC, ISO-8601). On each run, a row is selected when its window field is **later than** that recorded boundary.
+
+| Dataset | Window field (evaluated in order) | Window logic |
+|---|---|---|
+| `residents` | `updated_at`, otherwise `created_at` | Select rows whose window value is later than the checkpoint |
+| `resident_chronic_conditions` | `updated_at`, otherwise `created_at` | Select rows whose window value is later than the checkpoint |
+| `schedules` | `updated_at`, otherwise `created_at`, otherwise `date` | Select rows whose window value is later than the checkpoint; `date` is a fallback only |
+| `puroks` | `updated_at`, otherwise `created_at` | Select rows whose window value is later than the checkpoint |
+
+**Window boundary rules**
+
+- The comparison is strict (`window value > last_successful_extraction`), so a record exactly on the boundary is not extracted twice.
+- All values are normalized to UTC before comparison; date-only values are treated as midnight UTC.
+- If the checkpoint is missing or empty, the run performs a full load.
+- The checkpoint is updated to the run's extraction end timestamp **only when the run is `APPROVED`**, so a rejected or failed run is retried over the same window.
+- If a dataset has no supported timestamp column, the full dataset is retained and a `WARNING` is logged; the run then requires manual review instead of silently accepting the data.
+- Rows whose window value cannot be parsed are excluded, counted, and reported in the extraction log.
+- Late-arriving rows with timestamps older than the boundary are not captured automatically; they require a documented backfill or a controlled full reload.
 
 ---
 
@@ -99,6 +121,8 @@ The following limitations and assumptions apply:
 - Required health records must be available in the CitiCare database before extraction begins.
 - Required source tables and columns must exist.
 - Exported CSV datasets must be available and accessible to the Python extraction process.
+- Source tables should provide an `updated_at` or `created_at` timestamp for incremental filtering. A dataset without a window column is extracted in full and flagged for manual review.
+- The checkpoint file `data/checkpoint.json` must be readable. If it is missing, the run executes a full load.
 - Missing or incomplete source records may affect the extracted dataset.
 - Unexpected database schema changes may cause extraction validation to fail.
 - Missing or corrupted CSV files may interrupt an extraction run.
@@ -118,8 +142,11 @@ The `residents` table contains information required to identify residents, assoc
 | `resident_id` | BIGINT | Primary Key | Unique identifier of the resident |
 | `purok_id` | BIGINT | Foreign Key → `puroks(purok_id)` | Identifies the purok where the resident belongs |
 | `risk_level` | TEXT | — | Indicates the resident's health risk level |
+| `created_at` | TIMESTAMP | Extraction window column | Indicates when the resident record was created; used as the incremental window field when `updated_at` is unavailable |
 
-**Reason for inclusion:** Resident information is required to identify residents and support risk classification and purok-level health analysis.
+**Reason for inclusion:** Resident information is required to identify residents and support risk classification and purok-level health analysis. The window timestamp is included because the monthly incremental extraction cannot select changed records without it.
+
+> `updated_at` is also exported when the source table provides it and takes priority over `created_at` during incremental filtering. Window columns are used only to select records; they are not required transformation inputs.
 
 ---
 
@@ -134,9 +161,10 @@ The `resident_chronic_conditions` table contains chronic conditions recorded for
 | `condition_id` | BIGINT | Primary Key | Unique identifier of the chronic condition record |
 | `resident_id` | BIGINT | Foreign Key → `residents(resident_id)` | Identifies the resident who has the condition |
 | `condition_name` | TEXT | — | Name of the chronic condition |
-| `created_at` | TIMESTAMP | — | Indicates when the condition was recorded |
+| `created_at` | TIMESTAMP | Extraction window column | Indicates when the condition was recorded; used as the incremental window field |
+| `updated_at` | TIMESTAMP | Extraction window column (when present) | Indicates the last change to the record; preferred over `created_at` for incremental filtering |
 
-**Reason for inclusion:** Chronic condition records are required for disease prevalence and resident health analysis.
+**Reason for inclusion:** Chronic condition records are required for disease prevalence and resident health analysis. The window timestamp allows only newly recorded or modified conditions to be re-extracted each month.
 
 ---
 
@@ -152,8 +180,10 @@ The `schedules` table contains scheduled consultations associated with residents
 | `resident_id` | BIGINT | Foreign Key → `residents(resident_id)` | Identifies the resident associated with the schedule |
 | `date` | DATE | — | Indicates when the consultation is scheduled |
 | `status` | TEXT | — | Indicates whether the schedule was completed or missed |
+| `updated_at` | TIMESTAMP | Extraction window column (when present) | Indicates the last change to the schedule; preferred over `created_at` for incremental filtering |
+| `created_at` | TIMESTAMP | Extraction window column | Indicates when the schedule record was created |
 
-**Reason for inclusion:** Schedule records are required to identify and analyze missed health consultations.
+**Reason for inclusion:** Schedule records are required to identify and analyze missed health consultations. The window timestamps allow newly created or updated schedules to be captured each month.
 
 ---
 
@@ -167,8 +197,9 @@ The `puroks` table contains the purok information used to organize residents geo
 |---|---|---|---|
 | `purok_id` | BIGINT | Primary Key | Unique identifier of the purok |
 | `name` | TEXT | — | Name of the purok |
+| `created_at` | TIMESTAMP | Extraction window column | Indicates when the purok record was created; used when `updated_at` is unavailable |
 
-**Reason for inclusion:** Purok information is required to group resident health information and support purok-level prioritization and analysis.
+**Reason for inclusion:** Purok information is required to group resident health information and support purok-level prioritization and analysis. The window timestamp is required when purok records are added or renamed.
 
 ---
 
@@ -187,18 +218,23 @@ The `puroks` table contains the purok information used to organize residents geo
 The extraction stage focuses on verifying that the required health data was successfully obtained from the source datasets. Data cleaning, standardization, health classification, and other transformations are handled in the succeeding stages of the pipeline.
 
 
-| Check Name | Target | Purpose | Validation Criteria |
-|---|---|---|---|
-| Source Files | Exported CSV datasets | Verify that source datasets are available | Required CSV files are found |
-| Required Tables / Datasets | All required source data | Ensure required datasets are included | All required datasets are available |
-| Required Columns | Selected columns | Ensure required fields exist | All required columns exist |
-| Identifier Presence | Primary and foreign keys | Ensure records can be identified and related | Required identifiers are present |
-| Primary Key Uniqueness | Primary key columns | Detect duplicate identifiers | No duplicate primary keys |
-| Record Count | Extracted datasets | Verify records were retrieved | Record counts are successfully recorded |
-| Extraction Completeness | Extraction result | Detect incomplete extraction | Extraction completes without interruption |
-| Foreign Key Availability | Relationship columns | Verify relationships can be maintained | Required foreign-key values are present |
-| Extraction Error Check | Extraction process | Detect failures or interruptions | No unhandled extraction error |
-| Extraction Status | Pipeline run | Determine the result of extraction | Status is recorded as PASS, WARNING, or FAIL |
+| Check Name | Target | Purpose | Severity | PASS Criteria | FAIL Criteria |
+|---|---|---|---|---|---|
+| Source Connectivity | PostgreSQL source and credentials | Confirm the pipeline can reach and read the source | Critical | Connection is established within 30 seconds and a test `SELECT` returns a result | Connection, authentication, or query fails, or the connection times out |
+| Source File Availability | Exported CSV datasets | Verify that all source datasets are available and readable | Critical | 4 of 4 required CSV files exist in the input directory and each opens as UTF-8 with a readable header | Any required file is missing, locked, or unreadable |
+| Required Datasets | All required source data | Ensure every required dataset is loaded | Critical | 4 of 4 datasets are loaded successfully | One or more required datasets are absent |
+| Required Columns | Selected columns per dataset | Ensure every required field exists | Critical | 0 missing required columns in each dataset | 1 or more required columns are missing |
+| Column Naming Convention | All extracted column names | Detect inconsistent or unexpected naming | Non-critical | 100% of column names match `^[a-z][a-z0-9]*(_[a-z0-9]+)*$` | 1 or more column names do not match the convention |
+| Identifier Presence | Primary and foreign keys | Ensure records can be identified and related | Critical | 0 blank primary-key values and 0 blank required foreign-key values | 1 or more required identifiers are blank |
+| Primary Key Uniqueness | Primary key columns | Detect duplicate identifiers | Critical | 0 duplicate primary-key values per dataset | 1 or more duplicate primary keys are found |
+| Data Type Conformity | Column values | Verify values match the documented data type | Critical | 0 values fail the documented type for their column | 1 or more values have an invalid type |
+| Record Count Reconciliation | Extracted datasets | Verify extraction completeness | Critical | For every dataset, `records extracted + records rejected = records read`, and `records read` equals the number of data rows in the CSV | The counts do not reconcile for any dataset |
+| Foreign Key Availability | Relationship columns | Verify relationships can be maintained | Critical | 0 extracted `resident_id` or `purok_id` values are absent from the referenced dataset | 1 or more foreign-key values have no matching parent record |
+| Incremental Window Conformity | Extracted records | Confirm only in-window records were extracted | Critical | 0 extracted records have a window value earlier than or equal to the checkpoint | 1 or more extracted records fall outside the declared window |
+| Extraction Completion | Extraction process | Detect failures or interruptions | Critical | All 4 datasets are processed and a valid end timestamp is recorded | An unhandled exception occurs or the end timestamp is missing |
+| Extraction Status | Pipeline run | Determine the overall result of extraction | Critical | Status is recorded as `APPROVED`, `MANUAL REVIEW`, `REJECTED`, or `FAILED` | No status is recorded |
+
+A **Critical** check that fails blocks handover. A **Non-critical** check that fails produces a `WARNING`, which routes the run to manual review. The overall extraction status is `APPROVED` only when every critical check passes and no warning is open.
 
 ---
 # 4. Extraction Metadata and Log Specification
@@ -208,20 +244,22 @@ The CitiCare extraction process records metadata and logs for every extraction r
 
 | Metadata / Log Field | Purpose | Example Value / Format |
 |---|---|---|
-| Pipeline Run ID | Provides a unique identifier for each extraction run. | `CITICARE_EXT_20261001_001` |
+| Pipeline Run ID | Provides a unique identifier for each extraction run. | `CITICARE_EXT_20261114_3d209da2` |
 | Table / File Name | Identifies the PostgreSQL table or exported CSV file being processed. | `residents.csv` |
 | Extraction Start Timestamp | Records when Python started extracting data from the CSV file. | `2026-10-01 08:00:00` |
 | Extraction End Timestamp | Records when the extraction process finished. | `2026-10-01 08:02:15` |
-| Extraction Status | Indicates whether the extraction completed successfully. | `Success`, `Failed`, `Partial` |
+| Extraction Status | Indicates the overall result of the extraction. | `APPROVED`, `MANUAL REVIEW`, `REJECTED`, `FAILED` |
 | Records Read | Records the total number of records read from the exported CSV file. | `350` |
 | Records Extracted | Records the number of records successfully extracted and accepted as raw data. | `347` |
-| Records Rejected | Records the number of records rejected because of extraction or validation issues. | `3` |
-| Extraction Window | Identifies the monthly period covered by the incremental extraction. | `2026-09-01 to 2026-09-30` |
+| Records Rejected | Records excluded from the handover because they fall outside the extraction window or fail an extraction check. | `3` |
+| Extraction Window | Identifies the boundary and period covered by the incremental extraction. | `previous: 2026-10-01T00:00:00+00:00; current: 2026-11-01T00:00:00+00:00` |
 | Validation Results | Records the result of the extraction validation checks. | `Passed` or `Failed: 3 missing resident_id values` |
 | Error Message / Code | Records details of errors encountered during extraction. | `NULL` if successful; `CSV_READ_ERROR` if failed |
 | Extraction Duration | Measures the total time required to complete the extraction. | `00:02:15` |
 
 The **Pipeline Run ID** is used to identify and group CSV files processed during the same monthly extraction run. Each CSV file maintains its own log entry so that its record counts, validation results, and extraction status can be individually monitored.
+
+`Records Rejected` is calculated as `Records Read − Records Extracted`, so the counts must reconcile in every log entry. `Validation Results` stores the outcome of each named check from Section 3, including the failing check name and detail, and the `Extraction Window` records both the previous successful boundary and the current run timestamp.
 
 ### Use of Extraction Metadata and Logs
 
@@ -236,14 +274,16 @@ The extraction metadata and logs are used for **monitoring, troubleshooting, aud
 
 The CitiCare extraction logs are retained to provide a reliable history of pipeline activities and to support monitoring, troubleshooting, auditing, and recovery. Logs are managed to ensure that extraction records remain available when needed while preventing unnecessary long-term storage.
 
-| Log Management Area | Specification |
-|---|---|
-| Log Retention Period | Extraction logs will be retained for **12 months**. This period allows previous monthly extraction runs to be reviewed for troubleshooting, auditing, comparison, and recovery purposes. |
-| Storage Location | Extraction logs will be stored in a dedicated **logs directory** within the CitiCare ETL environment. |
-| Access Permissions | Access to extraction logs will be limited to **authorized developers or system administrators** responsible for maintaining and monitoring the ETL pipeline. |
-| Archiving Requirements | Logs older than the active operational period may be moved to an **archive directory** while still within the 12-month retention period. Archived logs must remain accessible when required for auditing or recovery. |
-| Deletion Rules | Logs may only be deleted after the **12-month retention period** and when they are no longer required for troubleshooting, auditing, or recovery. |
-| Responsible Process | Log deletion and archiving will be handled through the pipeline's **log management process** under the supervision of an authorized system administrator or developer. |
+| Log Management Area | Specification | Justification |
+|---|---|---|
+| Log Retention Period | Extraction logs are retained for **12 months**. | Covers a full annual cycle of monthly runs, allowing month-to-month comparison, year-end auditing, and recovery of recent batches. |
+| Storage Location | Extraction logs are stored in `Data_Pipelines/Extraction/logs/` (`extract.log`, `incremental.log`, `validate.log`, `handover.log`), with archived logs under `logs/archive/`. | Keeps operational evidence beside the extraction code and separates active from archived records. |
+| Access Permissions | Read/write access is limited to **authorized developers or system administrators** responsible for the ETL pipeline; no public or shared read access is granted. | Extraction logs contain resident identifiers and health details, so access is restricted to protect personal health information. |
+| Archiving Requirements | On the first run of a new month, the four active logs are moved automatically to `logs/archive/<year>/<name>-<year>-<month>.log` while still inside the 12-month retention period, and remain readable for auditing or recovery. The active log directory holds only the current month. | Preserves evidence without slowing normal troubleshooting on current logs. |
+| Deletion Rules | Archived operational logs older than **365 days** are deleted automatically at the start of a run. Active logs are never deleted. A `.hold` file placed in `logs/archive/` suspends automatic deletion while an investigation is open. | Prevents loss of evidence during an open investigation and avoids retaining personal health data longer than necessary. |
+| Responsible Process | Rotation, archiving, and retention are performed by the pipeline's log management process at the start of each run. An authorized system administrator or developer controls the `.hold` file and reviews the deletion events written to `handover.log`. | Assigns clear accountability for irreversible log actions. |
+
+Each run records `logs_archived`, `logs_purged`, `log_retention_days`, and `log_retention_hold` in `handover.log`, so archival and deletion actions are auditable.
 
 ### Operational Logs and Audit Records
 
@@ -303,6 +343,8 @@ The following datasets and fields are required for the CitiCare extraction proce
 
 Primary keys must contain unique and non-null values. Foreign keys must use the same identifier names as the primary keys they reference to maintain consistency between related datasets.
 
+The incremental window columns `updated_at` and `created_at` are exported when present in the source table. They are required only for extraction filtering and are not required transformation inputs. If a dataset has no window column, the extraction logs a warning and the run requires manual review.
+
 ### 2. Naming Convention
 
 CitiCare uses the following naming conventions for extracted data:
@@ -331,6 +373,8 @@ The current CitiCare source fields already follow the standardized naming conven
 | `date` | `date` | DATE | DATE | Direct |
 | `status` | `status` | TEXT | TEXT | Direct |
 | `name` | `name` | TEXT | TEXT | Direct |
+| `created_at` | `created_at` | TIMESTAMP | TIMESTAMP | Direct (window column) |
+| `updated_at` | `updated_at` | TIMESTAMP | TIMESTAMP | Direct (window column, when present) |
 
 A **Direct** mapping means that the source column name and data type already match the standardized field expected by the pipeline. If a source field uses a different name or data type in the future, the mapping must be documented before the data is accepted by the pipeline.
 
@@ -362,25 +406,28 @@ The CitiCare extraction acceptance and handover rules determine whether the raw 
 | Required CSV file or column is missing | One or more required datasets or fields are unavailable | **REJECTED** | Stop processing the affected dataset and record the failure in the extraction log | Automatic | Pipeline |
 | Required identifier is missing or invalid | Required primary or foreign key values are missing or cannot be validated | **REJECTED** | Quarantine the affected data and record the validation failure | Automatic | Pipeline |
 | Duplicate primary keys are detected | Primary key uniqueness validation fails | **REJECTED** | Quarantine the affected data for correction | Automatic | Pipeline |
-| Extracted record count does not match the CSV record count | Extraction completeness cannot be confirmed | **REJECTED** | Stop the affected extraction and retry after checking the source CSV file | Automatic | Pipeline |
-| Records fall outside the monthly extraction window | Extracted records do not satisfy the defined incremental extraction period | **REJECTED** | Quarantine the affected records and record the issue in the extraction log | Automatic | Pipeline |
+| Extracted record count does not reconcile | Records extracted plus records rejected do not equal records read | **REJECTED** | Stop the affected extraction and retry after checking the source CSV file | Automatic | Pipeline |
+| Extraction checkpoint is missing or unreadable | The stored incremental boundary cannot be parsed, so the next window cannot be determined | **FAILED** | Stop the extraction and rebuild the checkpoint from the last approved run | Automatic | System Administrator / Developer |
+| Source database is unreachable or credentials fail | Python cannot connect to or read the PostgreSQL source | **FAILED** | Stop the extraction, record the connection error, and retry after connectivity or credentials are corrected | Automatic | Pipeline / System Administrator |
 | Extraction is interrupted or a critical reading error occurs | Python cannot completely read or extract the required CSV data | **FAILED** | Stop the extraction, record the error, and retry after the issue is resolved | Automatic | Pipeline |
 
 ### Automatic Approval
 
-Extracted data is automatically approved when all critical validation checks return **PASS**. This includes successful file accessibility, presence of required datasets and columns, valid required identifiers, unique primary keys, matching record counts, valid extraction windows, and completion without critical extraction errors.
+Extracted data is automatically approved when all critical validation checks return **PASS**. This includes successful source connectivity and file accessibility, presence of required datasets and columns, valid required identifiers, unique primary keys, matching record counts, valid extraction windows, and completion without critical extraction errors.
 
 When these conditions are satisfied, the pipeline automatically passes the validated raw extracted data to the Transformation Stage.
 
 ### Manual Review
 
-Manual review is required when the extraction produces a **WARNING** that does not immediately make the data unusable. This may include unexpected additional columns or unusual record counts that still match the extracted CSV data.
+Manual review is required when the extraction produces a **WARNING** that does not immediately make the data unusable. This may include unexpected additional columns, a non-standard column name, or a dataset that had to be extracted in full because no supported window column was available.
 
 The affected data is temporarily held while the **System Administrator or Developer** reviews the warning. If the issue is determined to be acceptable, the extraction may be approved and passed to the Transformation Stage. If the issue affects data reliability, the extraction is rejected for correction.
 
 ### Rejection or Failure
 
-Extracted data is rejected when a critical validation check fails. Critical failures include missing required files or columns, invalid required identifiers, duplicate primary keys, incomplete extraction, records outside the defined extraction window, or critical extraction errors.
+Extracted data is rejected when a critical validation check fails. Critical failures include missing required files or columns, invalid required identifiers, duplicate primary keys, incomplete extraction, an unreadable extraction checkpoint, or critical extraction errors.
+
+Records that fall outside the monthly extraction window are excluded from the handover and counted in `Records Rejected`; they do not fail the run, because they belong to an earlier window.
 
 Rejected or affected data is **quarantined** to prevent it from entering the Transformation Stage. If the failure is caused by an extraction interruption or temporary file-reading problem, the extraction may be retried after the issue is corrected. All failures and retry results are recorded in the extraction logs.
 
@@ -406,14 +453,15 @@ Only data with an **APPROVED** extraction status is automatically handed over to
 
 | Validation Check | Required Result |
 |---|---|
-| Source accessibility | PASS |
+| Source connectivity | PASS |
+| Source file accessibility | PASS |
 | Required datasets/files | PASS |
 | Required columns | PASS |
 | Required identifiers | PASS |
 | Primary key uniqueness | PASS |
 | Record count and extraction completeness | PASS |
 | Incremental extraction window | PASS |
-| Extraction error check | PASS |
+| Extraction completion and error check | PASS |
 | **Overall Extraction** | **APPROVED** |
 
 If any non-critical check returns a **WARNING**, the overall extraction status becomes **MANUAL REVIEW**. If any critical check returns **FAIL**, the overall extraction status becomes **REJECTED** or **FAILED**, and the affected data cannot proceed to the Transformation Stage.
@@ -422,13 +470,16 @@ If any non-critical check returns a **WARNING**, the overall extraction status b
 
 The CitiCare extraction process may encounter issues when health records are exported from the PostgreSQL database into CSV files and subsequently extracted using Python. The following problems and mitigation measures are defined to maintain extraction completeness and reliability.
 
+This stage performs **no record cleaning, value standardization, health classification, or business transformation**. Missing values are rejected or quarantined rather than corrected, duplicate keys are rejected rather than merged, and `condition_name`, `risk_level`, and `status` values are not normalized here. All such work belongs to the Transformation Stage.
+
 | Problem | Possible Cause | Impact on Extraction | Proposed Solution / Mitigation |
 |---|---|---|---|
+| Source database unavailable | The PostgreSQL server is offline, the network is unreachable, or credentials have expired. | Python cannot export the required datasets, so the run cannot start or complete. | Confirm connectivity and credentials before the scheduled run, record `CONNECTION_ERROR`, and retry after access is restored. |
 | Missing CSV file | A required dataset was not exported from the PostgreSQL database or was saved in the wrong directory. | Python cannot extract the required dataset, resulting in an incomplete extraction run. | Verify that all required CSV files are present before extraction. Stop the affected extraction and record the missing file in the extraction log. |
 | Missing or changed columns | A column was removed, renamed, or changed in the PostgreSQL source before CSV export. | The exported CSV may no longer match the required schema, causing validation or processing errors. | Validate CSV columns against the documented schema. Reject the affected dataset until the column is restored or an approved field mapping is defined. |
-| Duplicate records | The same records may be included more than once in the exported CSV file. | Duplicate records may produce inaccurate counts and analytical results. | Check primary key uniqueness during extraction validation and quarantine duplicate records for review. |
-| Missing required identifiers | Required identifiers such as `resident_id`, `purok_id`, or other primary and foreign keys contain null or missing values. | Records may not be correctly identified or linked to related health records. | Validate required identifiers before handover. Reject or quarantine affected records until the issue is corrected. |
-| Incorrect incremental extraction window | Incorrect date or change-tracking conditions are used when selecting records for the monthly export. | Records may be missed or records from previous extraction periods may be extracted again. | Validate the extraction date range and store the previous successful extraction timestamp for use in determining the next extraction window. |
-| Record count mismatch | Python reads fewer records than the number contained in the exported CSV file due to incomplete reading, malformed rows, or interruption. | The extracted dataset may be incomplete and should not proceed to transformation. | Compare the number of records in the CSV with the number successfully extracted. Stop the affected dataset when the counts do not match and investigate before retrying. |
+| Duplicate records | The same records may be included more than once in the exported CSV file. | Duplicate records may produce inaccurate counts and analytical results. | Check primary key uniqueness during extraction validation and quarantine duplicate records for review. Duplicates are not merged in this stage. |
+| Missing required identifiers | Required identifiers such as `resident_id`, `purok_id`, or other primary and foreign keys contain null or missing values. | Records may not be correctly identified or linked to related health records. | Validate required identifiers before handover. Reject or quarantine affected records until the issue is corrected; do not impute identifiers. |
+| Incorrect incremental extraction window | The stored checkpoint is missing, stale, or uses a different timezone, so the wrong date conditions are applied. | Records may be missed or records from previous extraction periods may be extracted again. | Compare extracted window values with the stored checkpoint, normalize all timestamps to UTC, and update the checkpoint only after an approved run. Use a documented backfill for late-arriving records. |
+| Record count mismatch | Python reads fewer records than the number contained in the exported CSV file due to incomplete reading, malformed rows, or interruption. | The extracted dataset may be incomplete and should not proceed to transformation. | Compare `records read`, `records extracted`, and `records rejected` for every dataset. Stop the affected dataset when the counts do not reconcile and investigate before retrying. |
 | Invalid or malformed CSV data | The CSV file contains malformed rows, incorrect delimiters, encoding problems, or improperly formatted values. | Python may fail to read some or all records from the CSV file. | Validate file readability and CSV structure before processing. Record parsing errors and quarantine affected data for correction. |
 | Extraction process interruption | Python execution is interrupted because of a system error, unavailable file, or unexpected program failure. | The extraction may stop before all required records are processed, resulting in partial data. | Mark the extraction run as `FAILED` or `PARTIAL`, record the error in the extraction log, and retry the extraction after the cause has been resolved. |

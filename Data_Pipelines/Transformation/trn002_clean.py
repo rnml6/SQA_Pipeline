@@ -3,11 +3,17 @@
 Rules implemented here (Section 3):
     C-01  required values             -> quarantine the affected record
     C-02  whitespace cleanup          -> trim/collapse and log the modification
-    C-03  duplicate identifiers       -> quarantine every conflicting record
+    C-03  duplicate identifiers       -> keep one deterministic survivor, quarantine
+                                         every superseded record
     C-04  invalid values              -> quarantine with rule ID and reason
     C-05  orphan relationships        -> quarantine with the missing reference
     C-06  invalid characters          -> correct only under the approved rule,
                                          otherwise quarantine
+
+C-03 survivor order (Section 3 "Duplicate Handling"):
+    latest parseable updated_at, otherwise created_at
+    -> most non-empty fields
+    -> lexicographically smallest canonical row
 
 The parent reference set for C-05 is the approved parent records in the current
 handover plus the approved parent reference published with it. Stage 2 does not
@@ -18,17 +24,47 @@ Standardization rules S-01 to S-07 are applied by TRN-003 after cleaning.
 
 from __future__ import annotations
 
+import json
 from collections import Counter
+from datetime import datetime, timezone
 
 from trn000_config import (
     DATASETS,
     PROCESSING_ORDER,
     approved_reference_keys,
     normalize_space,
+    parse_iso_timestamp,
     quarantine_row,
     recover_condition_name,
     to_int,
 )
+
+_MIN_TIMESTAMP = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _row_rank(row: dict) -> tuple:
+    """Return the deterministic C-03 ranking key for one normalized row."""
+    timestamps = []
+    for column in ("updated_at", "created_at"):
+        if column in row:
+            parsed = parse_iso_timestamp(row.get(column))
+            if parsed is not None:
+                timestamps.append(parsed)
+    latest = max(timestamps) if timestamps else _MIN_TIMESTAMP
+    filled = sum(
+        1 for key, value in row.items()
+        if not key.startswith("_") and normalize_space(value) != ""
+    )
+    canonical = json.dumps(
+        {
+            key: normalize_space(value)
+            for key, value in sorted(row.items())
+            if not key.startswith("_")
+        },
+        sort_keys=True,
+        ensure_ascii=True,
+    )
+    return (bool(timestamps), latest, filled, canonical)
 
 
 def _reject(context: dict, dataset: str, row: dict, quarantine: list[dict],
@@ -57,6 +93,7 @@ def _normalize_whitespace(records: dict[str, list[dict]], rules: Counter) -> dic
                     changed = True
                 result[key] = text
             result["_modified"] = changed
+            result["_rank"] = _row_rank(result)
             if changed:
                 rules["C-02"] += 1
             output.append(result)
@@ -108,6 +145,7 @@ def _clean_puroks(rows: list[dict], parents: dict, context: dict, quarantine: li
             "purok_id": ids["purok_id"],
             "name": name,
             "_modified": row.get("_modified", False),
+            "_rank": row.get("_rank"),
         })
     return retained
 
@@ -137,6 +175,7 @@ def _clean_residents(rows: list[dict], parents: dict, context: dict, quarantine:
             "purok_id": ids["purok_id"],
             "risk_level": risk_level,
             "_modified": row.get("_modified", False),
+            "_rank": row.get("_rank"),
         })
     return retained
 
@@ -184,6 +223,7 @@ def _clean_conditions(rows: list[dict], parents: dict, context: dict, quarantine
             "condition_name": name,
             "created_at": normalize_space(row.get("created_at")),
             "_modified": row.get("_modified", False) or embedded or name != raw_name,
+            "_rank": row.get("_rank"),
         })
     return retained
 
@@ -216,6 +256,7 @@ def _clean_schedules(rows: list[dict], parents: dict, context: dict, quarantine:
             "date": date_value,
             "status": status,
             "_modified": row.get("_modified", False),
+            "_rank": row.get("_rank"),
         })
     return retained
 
@@ -230,7 +271,7 @@ _CLEANERS = {
 
 def _resolve_duplicates(dataset: str, rows: list[dict], context: dict,
                         quarantine: list[dict], rules: Counter) -> tuple[list[dict], int]:
-    """C-03: quarantine conflicting primary keys when no winner rule is approved."""
+    """C-03: keep the deterministic survivor and quarantine superseded records."""
     primary_key = DATASETS[dataset]["primary_key"]
     groups: dict[object, list[dict]] = {}
     for row in rows:
@@ -242,14 +283,23 @@ def _resolve_duplicates(dataset: str, rows: list[dict], context: dict,
         if len(group) == 1:
             retained.append(group[0])
             continue
-        duplicate_count += len(group)
-        rules["C-03"] += len(group)
+
+        survivor = max(
+            group,
+            key=lambda row: row.get("_rank") or (False, _MIN_TIMESTAMP, 0, ""),
+        )
+        retained.append(survivor)
+        duplicate_count += len(group) - 1
+        rules["C-03"] += len(group) - 1
         for row in group:
+            if row is survivor:
+                continue
             quarantine.append(quarantine_row(
                 context, dataset, key, "C-03", primary_key, key,
-                "DUPLICATE_PRIMARY_KEY",
-                f"{primary_key} {key} occurs {len(group)} times and no approved "
-                "authoritative-record rule resolves the conflict",
+                "DUPLICATE_PRIMARY_KEY_SUPERSEDED",
+                f"{primary_key} {key} was superseded by the record retained under "
+                "C-03 (latest updated_at/created_at, then completeness, then "
+                "canonical value)",
             ))
     return retained, duplicate_count
 

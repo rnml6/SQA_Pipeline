@@ -22,6 +22,7 @@ from trn000_config import (
     PROFILE_DIR,
     QUARANTINE_COLUMNS,
     QUARANTINE_DIR,
+    REJECTION_RATE_LIMIT,
     RULES_VERSION,
     append_event,
     iso_timestamp,
@@ -62,6 +63,9 @@ def build_metadata(context: dict, tables: dict, validation: dict, rules: dict) -
             "records_read": records_read.get(name, 0),
             "records_output": len(tables[name]),
             "records_rejected": records_rejected.get(name, 0),
+            "records_duplicates_excluded": validation["metrics"][
+                "records_duplicates_excluded"
+            ].get(name, 0),
             "records_modified": records_modified.get(name, 0),
             "validation_results": validation_results,
         }
@@ -82,6 +86,8 @@ def build_metadata(context: dict, tables: dict, validation: dict, rules: dict) -
         "records_duplicates_excluded": dict(validation["metrics"]["records_duplicates_excluded"]),
         "records_business_excluded": validation["metrics"]["records_business_excluded"],
         "records_modified": dict(records_modified),
+        "overall_rejection_rate": validation["metrics"]["overall_rejection_rate"],
+        "rejection_rate_threshold": REJECTION_RATE_LIMIT,
         "reference_parent_counts": dict(context.get("reference_counts", {})),
         "rules_applied": rules_applied,
         "validation_results": validation_results,

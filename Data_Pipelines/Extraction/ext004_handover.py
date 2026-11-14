@@ -17,6 +17,73 @@ HANDOVER_DATASETS = [
     "schedules",
 ]
 REFERENCE_DATASETS = ["puroks", "residents"]
+LOG_FILES = ("extract.log", "incremental.log", "validate.log", "handover.log")
+LOG_RETENTION_DAYS = 365
+
+
+def _month_key(moment):
+    return f"{moment:%Y-%m}"
+
+
+def archive_and_purge_logs(log_dir, now=None, retention_days=LOG_RETENTION_DAYS):
+    """Archive the previous month's logs and purge archives past retention.
+
+    Active logs hold only the current operational month. When a run starts in a
+    new month, the previous month's log files are moved to
+    ``logs/archive/<year>/<name>-<year>-<month>.log``. Archived operational logs
+    older than ``retention_days`` are deleted. Audit records are not touched.
+    """
+    log_dir = Path(log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    now = now or datetime.now(timezone.utc)
+    current_month = _month_key(now)
+
+    marker = log_dir / ".active_month"
+    previous_month = (
+        marker.read_text(encoding="utf-8").strip() if marker.is_file() else None
+    )
+    if not previous_month:
+        active = [
+            path for path in (log_dir / name for name in LOG_FILES)
+            if path.is_file() and path.stat().st_size
+        ]
+        if active:
+            newest = max(path.stat().st_mtime for path in active)
+            previous_month = _month_key(datetime.fromtimestamp(newest, timezone.utc))
+
+    archived = []
+    if previous_month and previous_month != current_month:
+        archive_dir = log_dir / "archive" / previous_month[:4]
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        for name in LOG_FILES:
+            source = log_dir / name
+            if not source.is_file() or not source.stat().st_size:
+                continue
+            target = archive_dir / f"{source.stem}-{previous_month}.log"
+            if target.exists():
+                target = archive_dir / f"{source.stem}-{previous_month}-{now:%H%M%S}.log"
+            shutil.move(str(source), str(target))
+            archived.append(str(target))
+    marker.write_text(current_month, encoding="utf-8")
+
+    purged = []
+    cutoff = now.timestamp() - retention_days * 86400
+    archive_root = log_dir / "archive"
+    hold = archive_root / ".hold"
+    if archive_root.is_dir() and not hold.is_file():
+        for path in sorted(archive_root.rglob("*.log")):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+                    purged.append(str(path))
+            except OSError:
+                continue
+    return {
+        "archived": archived,
+        "purged": purged,
+        "retention_days": retention_days,
+        "held": hold.is_file(),
+    }
 
 
 def acceptance(validation, warnings):
@@ -147,8 +214,14 @@ def write_handover(handover_dir, status, records, incremental, metadata, input_d
     return handover_dir
 
 
-def _append_process_logs(log_dir, metadata):
+def _append_process_logs(log_dir, metadata, log_maintenance=None):
     """Append standard line-oriented records to each process .log file."""
+    log_maintenance = log_maintenance or {
+        "archived": [],
+        "purged": [],
+        "retention_days": LOG_RETENTION_DAYS,
+        "held": False,
+    }
     status = metadata["extraction_status"]
     level = "INFO" if status == "APPROVED" else "WARNING" if status == "MANUAL REVIEW" else "ERROR"
     timestamp = metadata["extraction_end_timestamp"]
@@ -196,10 +269,11 @@ def _append_process_logs(log_dir, metadata):
             "source_system": "CitiCare: Barangay Gumamela Healthcare Monitoring System",
             "source_database": "CitiCare PostgreSQL Database",
             "file_format": "CSV",
-            "extraction_type": "Batch Extraction",
+            "extraction_type": "Incremental Batch Extraction",
             "extraction_tool": "Python",
             "extraction_schedule": "Monthly",
             "records_read": metadata["records_read"].get(dataset, 0),
+            "records_rejected": metadata["records_rejected"].get(dataset, 0),
             "error_message_code": metadata["error_message"] or "NULL",
             **common,
         })
@@ -211,6 +285,7 @@ def _append_process_logs(log_dir, metadata):
         "full_load": metadata["extraction_window"].get("full_load", False),
         "records_read": metadata["records_read"],
         "records_extracted": metadata["records_extracted"],
+        "records_rejected": metadata["records_rejected"],
         "error_message_code": metadata["error_message"] or "NULL",
         **common,
     })
@@ -250,6 +325,10 @@ def _append_process_logs(log_dir, metadata):
             if metadata["handover_status"] == "HELD"
             else "NOT_HANDED_OVER"
         ),
+        "logs_archived": log_maintenance["archived"],
+        "logs_purged": log_maintenance["purged"],
+        "log_retention_days": log_maintenance["retention_days"],
+        "log_retention_hold": log_maintenance["held"],
         "error_message_code": metadata["error_message"] or "NULL",
         **common,
     })
@@ -263,6 +342,12 @@ def write_result(handover_dir, status, records_read, records_extracted, validati
     started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
     duration_seconds = round((ended_at - started).total_seconds(), 3)
     run_id = f"CITICARE_EXT_{ended_at:%Y%m%d}_{uuid4().hex[:8]}"
+    extracted = records_extracted or {name: 0 for name in records_read}
+    if records_rejected is None:
+        records_rejected = {
+            name: max(int(records_read.get(name, 0)) - int(extracted.get(name, 0)), 0)
+            for name in records_read
+        }
     metadata = {
         "pipeline_run_id": run_id,
         "files": [f"{name}.csv" for name in records_read],
@@ -271,10 +356,8 @@ def write_result(handover_dir, status, records_read, records_extracted, validati
         "extraction_status": status,
         "handover_status": _handover_status(status),
         "records_read": records_read,
-        "records_extracted": records_extracted or {
-            name: 0 for name in records_read
-        },
-        "records_rejected": records_rejected or {name: 0 for name in records_read},
+        "records_extracted": extracted,
+        "records_rejected": records_rejected,
         "extraction_window": extraction_window,
         "validation_results": validation,
         "error_message": error_message,
@@ -287,5 +370,6 @@ def write_result(handover_dir, status, records_read, records_extracted, validati
 
     log_dir = Path(__file__).with_name("logs")
     log_dir.mkdir(parents=True, exist_ok=True)
-    _append_process_logs(log_dir, metadata)
+    log_maintenance = archive_and_purge_logs(log_dir)
+    _append_process_logs(log_dir, metadata, log_maintenance)
     return str(handover_path), run_id, metadata

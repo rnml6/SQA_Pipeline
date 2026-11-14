@@ -125,7 +125,6 @@ def run(input_dir=INPUT_DIR, handover_dir=HANDOVER_DIR,
         path, run_id, metadata = write_result(
             handover_dir, status, records_read, records_extracted, validation,
             started_at, extraction_window,
-            records_rejected={name: 0 for name in records_read},
             records=records, incremental=incremental, input_dir=input_dir,
         )
         if status == "APPROVED":
