@@ -20,10 +20,11 @@ from trn000_config import (
     OUTPUT_DIR,
     OUTPUT_FILES,
     PROFILE_DIR,
+    RULES_VERSION,
     QUARANTINE_COLUMNS,
     QUARANTINE_DIR,
     REJECTION_RATE_LIMIT,
-    RULES_VERSION,
+    RULE_PROFILED_ISSUES,
     append_event,
     iso_timestamp,
     sha256_file,
@@ -54,6 +55,15 @@ def build_metadata(context: dict, tables: dict, validation: dict, rules: dict) -
     records_rejected = context["records_rejected"]
     records_modified = context["records_modified"]
     rules_applied = {key: value for key, value in sorted(rules.items()) if value}
+    rule_trace = [
+        {
+            "rule_id": rule_id,
+            "profiled_issues": RULE_PROFILED_ISSUES.get(rule_id, []),
+            "records_affected": count,
+        }
+        for rule_id, count in rules_applied.items()
+        if rule_id.startswith(("C-", "S-"))
+    ]
     validation_results = _validation_summary(validation)
 
     files = []
@@ -90,6 +100,7 @@ def build_metadata(context: dict, tables: dict, validation: dict, rules: dict) -
         "rejection_rate_threshold": REJECTION_RATE_LIMIT,
         "reference_parent_counts": dict(context.get("reference_counts", {})),
         "rules_applied": rules_applied,
+        "rule_trace": rule_trace,
         "validation_results": validation_results,
         "error_code": context.get("error_code"),
         "error_message": context.get("error_message"),
@@ -165,6 +176,7 @@ def package(context: dict, tables: dict, validation: dict, profile: dict, rules:
                 ],
             },
             "business_rules": business_rules,
+            "rule_trace": metadata["rule_trace"],
             "join_cardinality": join_cardinality,
             "reference_parent_counts": context.get("reference_counts", {}),
             "quarantine": {

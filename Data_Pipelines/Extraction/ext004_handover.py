@@ -137,19 +137,19 @@ def _batch_window(extraction_window):
 
 
 def write_handover(handover_dir, status, records, incremental, metadata, input_dir):
-    """Write the approved incremental handover atomically.
+    """Write the validated handover atomically.
 
-    Only an APPROVED extraction publishes CSV files. A held or rejected run
-    invalidates the status marker while preserving any previous approved files
-    for audit and recovery; Stage 2 checks the marker and refuses to consume
-    them.
+    APPROVED and MANUAL REVIEW runs publish CSV files; a manual-review run is
+    marked ``HELD`` so Stage 2 refuses it until ``approve_handover`` records the
+    authorized decision. REJECTED and FAILED runs invalidate the status marker
+    while preserving any previous approved files for audit and recovery.
     """
     handover_dir = Path(handover_dir)
-    approved = status == "APPROVED"
+    publishable = status in ("APPROVED", "MANUAL REVIEW")
     records = records or {}
     incremental = incremental or {}
     handover_counts = {
-        name: len(incremental.get(name, [])) if approved else 0
+        name: len(incremental.get(name, [])) if publishable else 0
         for name in HANDOVER_DATASETS
     }
 
@@ -169,7 +169,7 @@ def write_handover(handover_dir, status, records, incremental, metadata, input_d
         "error_message": metadata.get("error_message"),
     }
 
-    if not approved:
+    if not publishable:
         handover_dir.mkdir(parents=True, exist_ok=True)
         document["preserved_previous_handover"] = any(
             (handover_dir / f"{name}.csv").is_file()
@@ -273,6 +273,7 @@ def _append_process_logs(log_dir, metadata, log_maintenance=None):
             "extraction_tool": "Python",
             "extraction_schedule": "Monthly",
             "records_read": metadata["records_read"].get(dataset, 0),
+            "records_extracted": metadata["records_extracted"].get(dataset, 0),
             "records_rejected": metadata["records_rejected"].get(dataset, 0),
             "error_message_code": metadata["error_message"] or "NULL",
             **common,
@@ -303,6 +304,10 @@ def _append_process_logs(log_dir, metadata, log_maintenance=None):
     for check in validation.get("checks", []):
         write_event(log_dir / "validate.log", "validate", "check", {
             "check_name": check.get("name"),
+            "target": check.get("target"),
+            "purpose": check.get("purpose"),
+            "severity": check.get("severity"),
+            "criteria": check.get("criteria"),
             "check_status": check.get("status"),
             "check_detail": check.get("detail"),
         })
@@ -373,3 +378,46 @@ def write_result(handover_dir, status, records_read, records_extracted, validati
     log_maintenance = archive_and_purge_logs(log_dir)
     _append_process_logs(log_dir, metadata, log_maintenance)
     return str(handover_path), run_id, metadata
+
+
+def approve_handover(handover_dir, reviewer):
+    """Record the authorized manual-review decision for a HELD handover.
+
+    Section 7: a MANUAL REVIEW run is held until the System Administrator or
+    Developer confirms the warning is acceptable. Approval changes the marker
+    only; the published data is unchanged.
+    """
+    handover_dir = Path(handover_dir)
+    path = handover_dir / "handover.json"
+    if not path.is_file():
+        raise FileNotFoundError(f"No handover metadata found at {path}")
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if (document.get("handover_status") != "HELD"
+            or document.get("extraction_status") != "MANUAL REVIEW"):
+        raise ValueError(
+            f"Handover status is {document.get('handover_status')}; only a HELD "
+            "MANUAL REVIEW handover can be approved."
+        )
+
+    reviewed_at = datetime.now(timezone.utc).isoformat()
+    document["extraction_status"] = "APPROVED"
+    document["handover_status"] = "APPROVED"
+    document["reviewed_by"] = reviewer
+    document["reviewed_at"] = reviewed_at
+    temp_file = handover_dir / f".handover.{uuid4().hex}.tmp"
+    temp_file.write_text(
+        json.dumps(document, indent=2, default=str) + "\n", encoding="utf-8"
+    )
+    os.replace(temp_file, path)
+
+    log_dir = Path(__file__).with_name("logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    with (log_dir / "handover.log").open("a", encoding="utf-8") as handle:
+        handle.write(
+            f"{reviewed_at} [INFO] citicare.extraction process=handover "
+            f"pipeline_run_id={document['pipeline_run_id']} event=manual_approval\n"
+        )
+        handle.write('  handover_status: "APPROVED"\n')
+        handle.write(f'  reviewer: "{reviewer}"\n')
+        handle.write(f'  handover_directory: "{handover_dir}"\n\n')
+    return document

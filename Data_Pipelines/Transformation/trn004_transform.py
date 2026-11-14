@@ -1,4 +1,4 @@
-"""TRN-004: apply the approved business transformation rules B-01 to B-05.
+"""TRN-004: apply the approved business transformation rules B-01 to B-08.
 
 Section 5 makes the enrichment and summary rules conditional ("when required",
 "if required by the output contract"). Section 6.1 states that any derived
@@ -8,9 +8,11 @@ datasets themselves. This module:
 
 * projects retained records onto the contracted output columns,
 * validates the B-01 resident-to-purok join and its cardinality,
-* records that B-02, B-03 and B-04 have no approved output schema, and
+* records that B-02, B-03 and B-04 have no approved output schema,
 * applies B-05 by keeping failed records out of the outputs while the
-  quarantine file preserves them with a rule ID and reason.
+  quarantine file preserves them with a rule ID and reason,
+* records B-06 (cancelled schedules retained), B-07 (natural keys), and
+  B-08 (no derived columns) as applied policies.
 """
 
 from __future__ import annotations
@@ -134,6 +136,28 @@ def transform(records: dict[str, list[dict]], context: dict,
                 "Records that failed a mandatory rule are excluded from the "
                 "business-ready outputs and preserved in the quarantine file "
                 "with a rule ID and reason."
+            ),
+        },
+        "B-06": {
+            "status": "APPLIED",
+            "detail": (
+                "CANCELLED is an approved schedule status. No schedule is "
+                "filtered by status; cancelled appointments remain in the "
+                "output and are identified by status = 'CANCELLED'."
+            ),
+        },
+        "B-07": {
+            "status": "APPLIED",
+            "detail": (
+                "Natural keys (resident_id, condition_id, schedule_id, "
+                "purok_id) are retained. No surrogate key is generated."
+            ),
+        },
+        "B-08": {
+            "status": "APPLIED",
+            "detail": (
+                "Only columns in the approved output contract are emitted; no "
+                "derived analytical column is created."
             ),
         },
     }

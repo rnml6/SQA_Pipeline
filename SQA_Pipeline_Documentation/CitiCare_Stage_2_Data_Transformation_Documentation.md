@@ -121,7 +121,7 @@ Affected percentage is calculated per source file: `affected_records / records_i
 
 # 3. Data Cleaning Rules
 
-The following rules define how identified data-quality issues are handled. Their application and record counts must be captured in the transformation logs.
+The following rules define how identified data-quality issues are handled. Their application and record counts must be captured in the transformation logs. Each fired rule is also written to `metadata.json` as `rule_trace`, which records the measured profile issue IDs (P-01 to P-16) the rule traces back to together with the number of affected records.
 
 | Rule ID | Target | Condition | Action | Profiled issue(s) | Justification |
 |---|---|---|---|---|---|
@@ -338,6 +338,7 @@ The transformation process must create metadata and logs for every batch run.
 | `overall_rejection_rate` | `records_rejected / records_read`, as a decimal and percentage | `0.0339` (3.39%) |
 | `rejection_rate_threshold` | Approved maximum rejection rate applied by V-09 | `0.05` (5.00%) |
 | `rules_applied` | Counts of records affected by each rule that fired | `S-05: 14`, `S-06: 29` |
+| `rule_trace` | Per fired rule, the profiled issue IDs it treats and the affected record count | `C-01: [P-01, P-02, ...], records: 2` |
 | `decision` | Acceptance decision | `APPROVED`, `MANUAL REVIEW`, `REJECTED` |
 | `handover_status` | Handover state | `APPROVED`, `HELD`, `REJECTED` |
 | `reference_parent_counts` | Approved parent keys available for referential checks | `puroks: 6`, `residents: 14` |

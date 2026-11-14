@@ -236,6 +236,8 @@ The extraction stage focuses on verifying that the required health data was succ
 
 A **Critical** check that fails blocks handover. A **Non-critical** check that fails produces a `WARNING`, which routes the run to manual review. The overall extraction status is `APPROVED` only when every critical check passes and no warning is open.
 
+Source Connectivity is executed before export with a 30-second connection timeout and a test `SELECT`. A failure records the `Source Connectivity` check and `CONNECTION_ERROR` in the extraction log, sets the run to `FAILED`, and stops the handover.
+
 ---
 # 4. Extraction Metadata and Log Specification
 
@@ -422,6 +424,8 @@ When these conditions are satisfied, the pipeline automatically passes the valid
 Manual review is required when the extraction produces a **WARNING** that does not immediately make the data unusable. This may include unexpected additional columns, a non-standard column name, or a dataset that had to be extracted in full because no supported window column was available.
 
 The affected data is temporarily held while the **System Administrator or Developer** reviews the warning. If the issue is determined to be acceptable, the extraction may be approved and passed to the Transformation Stage. If the issue affects data reliability, the extraction is rejected for correction.
+
+A `MANUAL REVIEW` run publishes its data with `handover_status = HELD`, so Stage 2 refuses it. The authorized reviewer records approval with `py run_pipeline.py --approve --reviewer "<name>"`, which changes the marker to `APPROVED` and updates the checkpoint; the reviewed data itself is not modified.
 
 ### Rejection or Failure
 

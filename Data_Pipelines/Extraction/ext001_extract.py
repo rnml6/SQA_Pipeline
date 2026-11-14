@@ -65,14 +65,70 @@ def read_csv_datasets(input_dir=INPUT_DIR):
     return records
 
 
-def export_from_postgresql(database_url=None, output_dir=INPUT_DIR):
-    """Export the six source tables. Requires psycopg[binary]."""
-    database_url = (
+CONNECT_TIMEOUT_SECONDS = 30
+
+
+def resolve_database_url(database_url=None):
+    """Return the configured PostgreSQL connection string."""
+    return (
         database_url
         or os.getenv("CITICARE_DATABASE_URL")
         or os.getenv("SUPABASE_DB_URL")
         or os.getenv("DATABASE_URL")
     )
+
+
+class SourceConnectivityError(RuntimeError):
+    """Raised when the Section 3 Source Connectivity check fails."""
+
+    def __init__(self, check):
+        super().__init__(check["detail"])
+        self.check = check
+
+
+def check_source_connectivity(database_url=None, timeout=CONNECT_TIMEOUT_SECONDS):
+    """Section 3: confirm the source is reachable within the documented timeout.
+
+    Returns a named validation check instead of raising so the failed check is
+    recorded in the extraction log and handover metadata.
+    """
+    check = {
+        "id": "source_connectivity",
+        "name": "Source Connectivity",
+        "target": "PostgreSQL source and credentials",
+        "purpose": "Confirm the pipeline can reach and read the source",
+        "severity": "Critical",
+        "criteria": (
+            f"Connection is established within {timeout} seconds and a test "
+            "SELECT returns a result"
+        ),
+        "status": "FAIL",
+        "detail": "",
+    }
+    url = resolve_database_url(database_url)
+    if not url:
+        check["detail"] = (
+            "No PostgreSQL connection string configured. Set CITICARE_DATABASE_URL, "
+            "SUPABASE_DB_URL, or DATABASE_URL."
+        )
+        return check
+    try:
+        import psycopg
+        with psycopg.connect(url, connect_timeout=timeout) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1")
+                cursor.fetchone()
+    except Exception as error:  # recorded as a failed critical check
+        check["detail"] = f"{type(error).__name__}: {error}"
+        return check
+    check["status"] = "PASS"
+    check["detail"] = "Connection established and test SELECT returned a result."
+    return check
+
+
+def export_from_postgresql(database_url=None, output_dir=INPUT_DIR):
+    """Export the six source tables. Requires psycopg[binary]."""
+    database_url = resolve_database_url(database_url)
     if not database_url:
         if os.getenv("SUPABASE_URL"):
             raise RuntimeError(

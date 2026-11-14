@@ -181,6 +181,24 @@ QUARANTINE_COLUMNS = [
     "quarantined_at",
 ]
 
+# Section 2/3 traceability: the profiled issue(s) each rule treats. The runtime
+# metadata records which issues each fired rule traces back to.
+RULE_PROFILED_ISSUES = {
+    "C-01": ["P-01", "P-02", "P-04", "P-05", "P-07", "P-08", "P-11", "P-12", "P-13", "P-14"],
+    "C-02": ["P-02", "P-10", "P-16"],
+    "C-03": ["P-01", "P-04", "P-07", "P-12"],
+    "C-04": ["P-09"],
+    "C-05": ["P-05", "P-08", "P-13"],
+    "C-06": ["P-03", "P-09"],
+    "S-01": ["P-14"],
+    "S-02": ["P-11"],
+    "S-03": ["P-02", "P-10"],
+    "S-04": ["P-01", "P-04", "P-07", "P-12"],
+    "S-05": ["P-06"],
+    "S-06": ["P-15"],
+    "S-07": ["P-09", "P-10"],
+}
+
 ISO_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 ISO_TIMESTAMP_PATTERN = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$"

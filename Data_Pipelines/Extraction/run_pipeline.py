@@ -11,12 +11,14 @@ from ext001_extract import (
     CHECKPOINT_FILE,
     HANDOVER_DIR,
     INPUT_DIR,
+    SourceConnectivityError,
+    check_source_connectivity,
     export_from_postgresql,
     read_csv_datasets,
 )
 from ext002_incremental import filter_incremental, save_checkpoint
-from ext003_validate import validate
-from ext004_handover import acceptance, write_result
+from ext003_validate import attach_reconciliation, validate
+from ext004_handover import acceptance, approve_handover, write_result
 
 EXIT_CODES = {
     "APPROVED": 0,
@@ -95,23 +97,28 @@ def run(input_dir=INPUT_DIR, handover_dir=HANDOVER_DIR,
     """
     started_at = datetime.now(timezone.utc).isoformat()
     records = {}
+    connectivity = None
     try:
         if export_source:
-            export_from_postgresql(
+            database_url = (
                 os.getenv("CITICARE_DATABASE_URL")
                 or os.getenv("SUPABASE_DB_URL")
-                or os.getenv("DATABASE_URL"),
-                input_dir,
+                or os.getenv("DATABASE_URL")
             )
+            connectivity = check_source_connectivity(database_url)
+            if connectivity["status"] != "PASS":
+                raise SourceConnectivityError(connectivity)
+            export_from_postgresql(database_url, input_dir)
         records = read_csv_datasets(input_dir)
         records_read = {name: len(rows) for name, rows in records.items()}
-        validation = validate(records)
+        validation = validate(records, connectivity)
         if full_load:
             incremental, warnings = records, []
         else:
             incremental, warnings = filter_incremental(records, checkpoint_file)
-        status = acceptance(validation, warnings)
         records_extracted = {name: len(rows) for name, rows in incremental.items()}
+        validation = attach_reconciliation(validation, records_read, records_extracted)
+        status = acceptance(validation, warnings)
         previous = None
         if Path(checkpoint_file).exists():
             previous = json.loads(
@@ -130,6 +137,18 @@ def run(input_dir=INPUT_DIR, handover_dir=HANDOVER_DIR,
         if status == "APPROVED":
             save_checkpoint(checkpoint_file, metadata["extraction_end_timestamp"], run_id)
         return {"status": status, "handover": str(path), "metadata": metadata}
+    except SourceConnectivityError as error:
+        records_read = {name: len(rows) for name, rows in records.items()}
+        check = error.check
+        path, _, metadata = write_result(
+            handover_dir, "FAILED", records_read, {},
+            {"status": "FAIL", "checks": [check], "errors": [check["detail"]],
+             "warnings": []},
+            started_at, {"previous_successful_extraction": None,
+                         "current_extraction": started_at, "full_load": full_load},
+            "CONNECTION_ERROR", records=records, incremental={}, input_dir=input_dir,
+        )
+        return {"status": "FAILED", "handover": str(path), "metadata": metadata}
     except (FileNotFoundError, ValueError) as error:
         records_read = {name: len(rows) for name, rows in records.items()}
         path, _, metadata = write_result(
@@ -162,7 +181,29 @@ if __name__ == "__main__":
                         help="Approved handover directory (default: data/handover)")
     parser.add_argument("--checkpoint-file", default=str(CHECKPOINT_FILE),
                         help="Extraction boundary file (default: data/checkpoint.json)")
+    parser.add_argument("--approve", action="store_true",
+                        help="Approve a HELD MANUAL REVIEW handover after review")
+    parser.add_argument("--reviewer", default=None,
+                        help="Reviewer name required with --approve")
     args = parser.parse_args()
+    if args.approve:
+        if not args.reviewer:
+            print("--reviewer is required with --approve")
+            sys.exit(1)
+        try:
+            metadata = approve_handover(Path(args.handover_dir), args.reviewer)
+        except (FileNotFoundError, ValueError) as error:
+            print(f"Approval FAILED: {error}")
+            sys.exit(3)
+        save_checkpoint(
+            Path(args.checkpoint_file),
+            metadata["extraction_end_timestamp"],
+            metadata["pipeline_run_id"],
+        )
+        print(
+            f"Handover {metadata['pipeline_run_id']} approved by {args.reviewer}."
+        )
+        sys.exit(0)
     result = run(
         handover_dir=Path(args.handover_dir),
         checkpoint_file=Path(args.checkpoint_file),
