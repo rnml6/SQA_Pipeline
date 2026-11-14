@@ -84,7 +84,18 @@ def export_from_postgresql(database_url=None, output_dir=INPUT_DIR):
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    with psycopg.connect(database_url) as connection:
+    try:
+        connection = psycopg.connect(database_url)
+    except psycopg.OperationalError as error:
+        raise RuntimeError(
+            "Could not connect to the CitiCare PostgreSQL source. Supabase direct "
+            "hosts (db.<project-ref>.supabase.co) are IPv6-only, so an IPv4-only "
+            "network must use the Supavisor pooler string from Supabase Dashboard > "
+            "Connect (postgresql://postgres.<project-ref>:<password>@"
+            "aws-1-<region>.pooler.supabase.com:5432/postgres). "
+            f"Original error: {error}"
+        ) from error
+    with connection:
         for table, (_, columns) in DATASETS.items():
             with connection.cursor() as cursor:
                 cursor.execute(
